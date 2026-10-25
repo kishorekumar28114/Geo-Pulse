@@ -1,228 +1,307 @@
 const express = require('express');
 const multer = require('multer');
-const Attendance = require('../models/Attendance');
-const User = require('../models/User');
 const path = require('path');
 const fs = require('fs');
 const authMiddleware = require('../middleware/auth');
-const router = express.Router();
+const { attendanceLimiter } = require('../middleware/rateLimit');
+const Attendance = require('../models/Attendance');
+const AttendanceAttempt = require('../models/AttendanceAttempt');
+const User = require('../models/User');
+const { HOSTEL_LAT, HOSTEL_LON, ALLOWED_RADIUS_METERS, MAX_IMAGE_SIZE_BYTES, ALLOWED_MIME_TYPES } = require('../config/constants');
+const { getDistanceMeters, getIstDateStr, getIstTimeStr } = require('../utils/geoAndDate');
+const { getOrCreateSessionInstance, deriveStudentStatus, getSessionConfig } = require('../services/sessionService');
 
+const router = express.Router();
 router.use(authMiddleware);
 
-
-const HOSTEL_LAT = 10.827764;
-const HOSTEL_LON = 77.060015;
-const ALLOWED_RADIUS_METERS = 500;
-
+// Multer storage configuration with sanitized unique filename
+const uploadsDir = path.join(__dirname, '../../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, path.join(__dirname, '../../uploads'));
+    cb(null, uploadsDir);
   },
   filename: function (req, file, cb) {
-    // Get original extension or fallback to .jpg
     let ext = '.jpg';
     if (file.mimetype === 'image/png') ext = '.png';
-    else if (file.mimetype === 'image/jpeg') ext = '.jpg';
-    else if (file.mimetype === 'image/jpg') ext = '.jpg';
-    // Use timestamp + random for filename
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + ext);
-  }
+    else if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/jpg') ext = '.jpg';
+    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, uniqueSuffix);
+  },
 });
 
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  storage,
+  limits: { fileSize: MAX_IMAGE_SIZE_BYTES },
   fileFilter: function (req, file, cb) {
-    if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/png' || file.mimetype === 'image/jpg') {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only .jpg, .jpeg, .png files allowed!'));
+      cb(new Error('Invalid image format. Only JPEG and PNG are permitted.'));
     }
+  },
+});
+
+/**
+ * GET /api/attendance/sessions
+ * Returns today's sessions, deadlines, and current student's status
+ */
+router.get('/sessions', async (req, res) => {
+  try {
+    const today = getIstDateStr();
+    const morningInstance = await getOrCreateSessionInstance(today, 'morning');
+    const eveningInstance = await getOrCreateSessionInstance(today, 'evening');
+
+    const studentId = req.user.id;
+    const records = await Attendance.find({
+      studentId,
+      date: today,
+    });
+
+    const morningRecord = records.find((r) => r.session === 'morning');
+    const eveningRecord = records.find((r) => r.session === 'evening');
+
+    const now = new Date();
+
+    const formatSessionInfo = (instance, record) => {
+      const derivedStatus = deriveStudentStatus(record, instance);
+      const isWindowOpen = now >= instance.startTime && now <= instance.deadline;
+      const canSubmit = isWindowOpen && !record;
+
+      return {
+        session: instance.session,
+        date: instance.date,
+        startTime: instance.startTime,
+        endTime: instance.endTime,
+        deadline: instance.deadline,
+        lifecycleStatus: instance.lifecycleStatus,
+        status: derivedStatus,
+        canSubmit,
+        isWindowOpen,
+        attendanceRecord: record
+          ? {
+              id: record._id,
+              status: record.status,
+              timestamp: record.timestamp,
+              latitude: record.latitude,
+              longitude: record.longitude,
+              distanceMeters: record.distanceMeters,
+              evidenceUrl: record.imageUrl ? `/api/evidence/${record.imageUrl}` : null,
+              source: record.source,
+            }
+          : null,
+      };
+    };
+
+    res.json({
+      today,
+      currentTime: now,
+      sessions: [
+        formatSessionInfo(morningInstance, morningRecord),
+        formatSessionInfo(eveningInstance, eveningRecord),
+      ],
+      hostelConfig: {
+        radiusMeters: ALLOWED_RADIUS_METERS,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Error retrieving session status', error: err.message });
   }
 });
 
+/**
+ * POST /api/attendance/register
+ * Student registers attendance with photo evidence and GPS coordinates
+ */
+router.post('/register', attendanceLimiter, upload.single('image'), async (req, res) => {
+  const cleanupFile = () => {
+    if (req.file && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {
+        console.error('Failed to unlink file:', e.message);
+      }
+    }
+  };
 
-function getDistanceMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
-  const toRad = deg => deg * Math.PI / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-
-function getIstDateTime(dateObj) {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    hour12: false
-  });
-  const parts = formatter.formatToParts(dateObj);
-  const partMap = {};
-  for (const part of parts) {
-    partMap[part.type] = part.value;
-  }
-  const dateStr = `${partMap.year}-${partMap.month}-${partMap.day}`;
-  const hour = parseInt(partMap.hour, 10);
-  return { dateStr, hour };
-}
-
-function getSessionAndValidity(dateObj) {
-  const { hour } = getIstDateTime(dateObj);
-  if (hour >= 9 && hour < 11) return { session: 'morning', valid: true };
-  if (hour >= 11 && hour < 16) return { session: 'evening', valid: true };
-  return { session: null, valid: false };
-}
-
-router.post('/register', upload.single('image'), async (req, res) => {
   try {
-    const { latitude, longitude, timestamp } = req.body;
-    const rollnumber = req.user.rollnumber;
-    // Check required fields
-    if (!latitude || !longitude || !timestamp || !req.file) {
-      return res.status(400).json({ message: 'Missing required fields' });
+    const { latitude, longitude, timestamp, session } = req.body;
+    const studentId = req.user.id;
+
+    if (!latitude || !longitude || !req.file) {
+      cleanupFile();
+      return res.status(400).json({ message: 'Latitude, longitude, and photo evidence are required' });
     }
 
     const lat = Number(latitude);
     const lon = Number(longitude);
-    const tsNum = Number(timestamp);
-    if (isNaN(lat) || isNaN(lon) || isNaN(tsNum)) {
-      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(400).json({ message: 'Invalid latitude, longitude, or timestamp' });
-    }
-    const user = await User.findOne({ rollnumber });
-    if (!user) {
-      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(404).json({ message: 'User not found' });
+    const ts = timestamp ? Number(timestamp) : Date.now();
+
+    if (isNaN(lat) || isNaN(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      cleanupFile();
+      return res.status(400).json({ message: 'Invalid GPS coordinates provided' });
     }
 
+    // Determine session: use requested session or infer from current time
+    const today = getIstDateStr();
+    let targetSession = session;
 
-    const ts = new Date(tsNum);
-    if (isNaN(ts.getTime())) {
-      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(400).json({ message: 'Invalid timestamp' });
-    }
+    if (!targetSession || !['morning', 'evening'].includes(targetSession)) {
+      // Infer based on current open window
+      const now = new Date();
+      const morningInstance = await getOrCreateSessionInstance(today, 'morning');
+      const eveningInstance = await getOrCreateSessionInstance(today, 'evening');
 
-    const dist = getDistanceMeters(lat, lon, HOSTEL_LAT, HOSTEL_LON);
-    console.log(`User at (${lat}, ${lon}), hostel at (${HOSTEL_LAT}, ${HOSTEL_LON}), distance: ${dist} meters, allowed: ${ALLOWED_RADIUS_METERS}`);
-    const inHostel = dist <= ALLOWED_RADIUS_METERS;
-
-    const { session, valid } = getSessionAndValidity(ts);
-    const { dateStr } = getIstDateTime(ts);
-    if (!valid) {
-      const count = await Attendance.countDocuments({ studentId: user._id, date: dateStr, session: { $in: ['morning', 'evening'] } });
-      if (count >= 3) {
-        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        return res.status(400).json({ message: 'Max attempts reached for today' });
-      }
-      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(400).json({ message: 'Attendance not in allowed time slot' });
-    }
-
-    const already = await Attendance.findOne({
-      studentId: user._id,
-      date: dateStr,
-      session,
-      status: { $in: ['present', 'absent'] }
-    });
-    if (already) {
-      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(409).json({ message: 'Attendance already marked for this session' });
-    }
-
-
-    if (!inHostel) {
-
-      const failCount = await Attendance.countDocuments({
-        studentId: user._id,
-        date: dateStr,
-        session,
-        status: 'failed-location',
-      });
-      if (failCount < 2) {
-
-        const failAttempt = new Attendance({
-          studentId: user._id,
-          date: dateStr,
-          timestamp: tsNum,
-          latitude: lat,
-          longitude: lon,
-          status: 'failed-location',
-          session,
-          imageUrl: req.file.filename,
-        });
-        await failAttempt.save();
-        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        return res.status(400).json({
-          message: `Location invalid. ${2 - failCount} attempt(s) remaining before marking absent.`,
-          attemptsUsed: failCount + 1,
-          maxAttempts: 3
-        });
+      if (now >= morningInstance.startTime && now <= morningInstance.deadline) {
+        targetSession = 'morning';
+      } else if (now >= eveningInstance.startTime && now <= eveningInstance.deadline) {
+        targetSession = 'evening';
       } else {
-
-        const attendance = new Attendance({
-          studentId: user._id,
-          date: dateStr,
-          timestamp: tsNum,
-          latitude: lat,
-          longitude: lon,
-          status: 'absent',
-          session,
-          imageUrl: req.file.filename,
-        });
-        await attendance.save();
-        return res.json({ message: 'Attendance marked as absent (location invalid after 3 attempts)', attendance });
+        // Fallback to closest or current time
+        const currentIstTime = getIstTimeStr(now);
+        targetSession = currentIstTime < '14:00' ? 'morning' : 'evening';
       }
-    } else {
+    }
 
-      const attendance = new Attendance({
-        studentId: user._id,
-        date: dateStr,
-        timestamp: tsNum,
+    const sessionInstance = await getOrCreateSessionInstance(today, targetSession);
+    const now = new Date();
+
+    // Check if session has opened
+    if (now < sessionInstance.startTime) {
+      cleanupFile();
+      return res.status(400).json({
+        message: `Attendance for ${targetSession} session has not opened yet. Starts at ${sessionInstance.startTime.toLocaleTimeString()}.`,
+      });
+    }
+
+    // Check if grace period deadline has passed
+    if (now > sessionInstance.deadline) {
+      cleanupFile();
+      return res.status(400).json({
+        message: `Attendance deadline for ${targetSession} session expired at ${sessionInstance.deadline.toLocaleTimeString()}.`,
+      });
+    }
+
+    // Check if attendance already recorded
+    const existing = await Attendance.findOne({
+      studentId,
+      date: today,
+      session: targetSession,
+    });
+
+    if (existing) {
+      cleanupFile();
+      return res.status(409).json({
+        message: `Attendance has already been recorded as ${existing.status} for this session.`,
+        record: existing,
+      });
+    }
+
+    // Calculate distance from configured hostel coordinates using Haversine
+    const distanceMeters = getDistanceMeters(lat, lon, HOSTEL_LAT, HOSTEL_LON);
+    const isWithinRadius = distanceMeters <= ALLOWED_RADIUS_METERS;
+
+    // If outside radius: record attempt, DO NOT mark absent!
+    if (!isWithinRadius) {
+      await AttendanceAttempt.create({
+        studentId,
+        sessionInstanceId: sessionInstance._id,
+        date: today,
+        session: targetSession,
+        timestamp: ts,
+        outcomeReason: 'out_of_radius',
         latitude: lat,
         longitude: lon,
-        status: 'present',
-        session,
+        distanceMeters,
         imageUrl: req.file.filename,
+        ipAddress: req.ip,
       });
-      await attendance.save();
-      return res.json({ message: 'Attendance marked as present', attendance });
-    }
-  } catch (err) {
 
-    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    res.status(500).json({ message: 'Server error', error: err.message });
+      // Keep photo for admin verification of attempt or delete if desired
+      return res.status(400).json({
+        message: `Location validation failed. You are ${distanceMeters} meters away from the hostel (allowed: ${ALLOWED_RADIUS_METERS}m). Please mark attendance from within the hostel premises.`,
+        distanceMeters,
+        allowedRadius: ALLOWED_RADIUS_METERS,
+      });
+    }
+
+    // Within radius: Persist authoritative PRESENT record
+    const attendance = new Attendance({
+      studentId,
+      sessionInstanceId: sessionInstance._id,
+      date: today,
+      session: targetSession,
+      status: 'present',
+      timestamp: ts,
+      latitude: lat,
+      longitude: lon,
+      distanceMeters,
+      imageUrl: req.file.filename,
+      source: 'student-app',
+    });
+
+    await attendance.save();
+
+    res.status(200).json({
+      message: 'Attendance recorded successfully as Present!',
+      attendance: {
+        id: attendance._id,
+        date: attendance.date,
+        session: attendance.session,
+        status: attendance.status,
+        timestamp: attendance.timestamp,
+        distanceMeters: attendance.distanceMeters,
+      },
+    });
+  } catch (err) {
+    cleanupFile();
+    // Prevent duplicate key crash
+    if (err.code === 11000) {
+      return res.status(409).json({ message: 'Attendance already recorded for this session.' });
+    }
+    res.status(500).json({ message: 'Failed to record attendance', error: err.message });
   }
 });
 
-
+/**
+ * GET /api/attendance/history
+ * Retrieve personal attendance history for student, or filter for admin
+ */
 router.get('/history', async (req, res) => {
   try {
-    const { rollnumber, studentId, date } = req.query;
-    let userId = req.user.id;
+    const { date, session, studentId: queryStudentId, rollnumber } = req.query;
+    let targetStudentId = req.user.id;
+
+    // Non-admin can only view their own history
     if (req.user.isAdmin) {
-      if (studentId) {
-        userId = studentId;
+      if (queryStudentId) {
+        targetStudentId = queryStudentId;
       } else if (rollnumber) {
-        const user = await User.findOne({ rollnumber });
-        if (!user) return res.status(404).json({ message: 'User not found' });
-        userId = user._id;
+        const student = await User.findOne({ rollnumber: rollnumber.trim().toLowerCase() });
+        if (!student) return res.status(404).json({ message: 'Student not found' });
+        targetStudentId = student._id;
       }
     }
-    if (!userId) return res.status(400).json({ message: 'No user specified' });
-    const query = { studentId: userId, status: { $in: ['present', 'absent'] } };
-    if (date) query.date = date;
-    const history = await Attendance.find(query).sort({ timestamp: -1 });
-    res.json({ history });
+
+    const filter = { studentId: targetStudentId };
+    if (date) filter.date = date;
+    if (session) filter.session = session;
+
+    const history = await Attendance.find(filter)
+      .sort({ timestamp: -1 })
+      .lean();
+
+    const formattedHistory = history.map((rec) => ({
+      ...rec,
+      evidenceUrl: rec.imageUrl ? `/api/evidence/${rec.imageUrl}` : null,
+    }));
+
+    res.json({ history: formattedHistory });
   } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+    res.status(500).json({ message: 'Failed to fetch history', error: err.message });
   }
 });
 
