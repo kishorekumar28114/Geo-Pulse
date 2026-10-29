@@ -22,20 +22,40 @@ app.use(
 
 // CORS configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',')
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim().replace(/\/+$/, ''))
   : ['http://localhost:3000', 'http://127.0.0.1:3000'];
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      const normalizedOrigin = origin.replace(/\/+$/, '');
+
+      // Allow if origin is explicitly in allowedOrigins list
+      if (allowedOrigins.includes(normalizedOrigin)) {
         return callback(null, true);
       }
+
+      // Automatically allow any Vercel preview or production deployment (*.vercel.app)
+      if (
+        normalizedOrigin.endsWith('.vercel.app') ||
+        normalizedOrigin.includes('localhost') ||
+        process.env.NODE_ENV !== 'production'
+      ) {
+        return callback(null, true);
+      }
+
+      console.warn(`[CORS Blocked] Origin: ${origin}. Allowed Origins: ${allowedOrigins.join(', ')}`);
       return callback(new Error('CORS policy: Access denied from this origin.'));
     },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
+
 
 app.use(express.json());
 
