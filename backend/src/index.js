@@ -25,37 +25,39 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim().replace(/\/+$/, ''))
   : ['http://localhost:3000', 'http://127.0.0.1:3000'];
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
-      if (!origin) return callback(null, true);
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
 
-      const normalizedOrigin = origin.replace(/\/+$/, '');
+    const normalizedOrigin = origin.replace(/\/+$/, '');
 
-      // Allow if origin is explicitly in allowedOrigins list
-      if (allowedOrigins.includes(normalizedOrigin)) {
-        return callback(null, true);
-      }
+    // Allow if origin is explicitly in allowedOrigins list
+    if (allowedOrigins.includes(normalizedOrigin)) {
+      return callback(null, true);
+    }
 
-      // Automatically allow any Vercel preview or production deployment (*.vercel.app)
-      if (
-        normalizedOrigin.endsWith('.vercel.app') ||
-        normalizedOrigin.includes('localhost') ||
-        process.env.NODE_ENV !== 'production'
-      ) {
-        return callback(null, true);
-      }
+    // Automatically allow any Vercel preview or production deployment (*.vercel.app)
+    if (
+      normalizedOrigin.endsWith('.vercel.app') ||
+      normalizedOrigin.includes('localhost') ||
+      process.env.NODE_ENV !== 'production'
+    ) {
+      return callback(null, true);
+    }
 
-      console.warn(`[CORS Blocked] Origin: ${origin}. Allowed Origins: ${allowedOrigins.join(', ')}`);
-      return callback(new Error('CORS policy: Access denied from this origin.'));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
+    console.warn(`[CORS Blocked] Origin: ${origin}. Allowed Origins: ${allowedOrigins.join(', ')}`);
+    return callback(new Error('CORS policy: Access denied from this origin.'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  optionsSuccessStatus: 204,
+};
 
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 
@@ -67,13 +69,13 @@ if (!fs.existsSync(uploadsDir)) {
 
 // Database Readiness Middleware: If MongoDB is not connected, return 503 instead of crashing or connection refused
 app.use((req, res, next) => {
-  if (req.path === '/api/health') return next();
+  // Always let preflight OPTIONS and health checks through
+  if (req.method === 'OPTIONS' || req.path === '/api/health') return next();
   if (mongoose.connection.readyState !== 1) {
     return res.status(503).json({
       message:
-        'Database connection is pending or offline. If using MongoDB Atlas, please ensure your IP (103.183.240.250) or 0.0.0.0/0 is whitelisted in Atlas Network Access.',
+        'Database connection is pending or offline. If using MongoDB Atlas, please ensure your IP is whitelisted.',
       status: 'database_unavailable',
-      currentIp: '103.183.240.250',
     });
   }
   next();
