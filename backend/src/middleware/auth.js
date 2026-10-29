@@ -3,7 +3,8 @@ const User = require('../models/User');
 
 const authMiddleware = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  // Support Bearer header or ?token query param (for exports/file downloads)
+  const token = (authHeader && authHeader.split(' ')[1]) || req.query.token;
 
   if (!token) {
     return res.status(401).json({ message: 'No authentication token provided, authorization denied' });

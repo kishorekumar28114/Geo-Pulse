@@ -333,14 +333,46 @@ const AdminPanelPage = () => {
     }
   };
 
+  const downloadCsvBlob = async (url, fallbackFilename) => {
+    try {
+      const res = await axios.get(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        responseType: "blob",
+      });
+
+      const disposition = res.headers["content-disposition"];
+      let filename = fallbackFilename;
+      if (disposition && disposition.includes("filename=")) {
+        const matches = disposition.match(/filename="?([^";]+)"?/);
+        if (matches && matches[1]) filename = matches[1];
+      }
+
+      const blob = new Blob([res.data], { type: "text/csv;charset=utf-8;" });
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+    } catch (err) {
+      setSnackbar({
+        open: true,
+        message: err.response?.data?.message || "Failed to download CSV export.",
+        severity: "error",
+      });
+    }
+  };
+
   const downloadDailyCsv = () => {
     const url = `${API_BASE_URL}/api/admin/export/daily?date=${selectedDate}&session=${selectedSession}`;
-    window.open(url, "_blank");
+    downloadCsvBlob(url, `attendance-${selectedDate}-${selectedSession}.csv`);
   };
 
   const downloadRoomWiseCsv = () => {
     const url = `${API_BASE_URL}/api/admin/export/room-wise?date=${selectedDate}&session=${selectedSession}`;
-    window.open(url, "_blank");
+    downloadCsvBlob(url, `room-attendance-${selectedDate}-${selectedSession}.csv`);
   };
 
   const downloadStudentCsv = () => {
@@ -351,7 +383,7 @@ const AdminPanelPage = () => {
     const url = `${API_BASE_URL}/api/admin/export/student?rollnumber=${encodeURIComponent(
       studentReportRoll
     )}`;
-    window.open(url, "_blank");
+    downloadCsvBlob(url, `student-${studentReportRoll}-history.csv`);
   };
 
   // -------------------------------------------------------------------------
